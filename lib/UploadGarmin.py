@@ -70,6 +70,7 @@ class APIException(ServiceException):
 class UserExceptionType:
     # Account-level exceptions (not a hardcoded thing, just to keep these seperate)
     Authorization = "auth"
+    RenewPassword = "renew_password"
     AccountFull = "full"
     AccountExpired = "expired"
     AccountUnpaid = "unpaid" # vs. expired, which implies it was at some point function, via payment or trial or otherwise.
@@ -216,22 +217,36 @@ class UploadGarmin:
             if ssoResp.status_code != 200:
                 raise APIException("SSO error %s %s" % (ssoResp.status_code, ssoResp.text))
 
+	    if "renewPassword" in ssoResp.text:
+		raise APIException("Reset password", block=True, user_exception=UserException(UserExceptionType.RenewPassword, intervention_required=True))
             ticket_match = re.search("ticket=([^']+)'", ssoResp.text)
             if not ticket_match:
                 raise APIException("Invalid login", block=True, user_exception=UserException(UserExceptionType.Authorization, intervention_required=True))
             ticket = ticket_match.groups(1)[0]
 
             # ...AND WE'RE NOT DONE YET!
+            # Stolen from cpfair/tapirilk
 
             self._rate_limit()
-            gcRedeemResp1 = requests.get("https://connect.garmin.com/post-auth/login", params={"ticket": ticket}, allow_redirects=False, cookies=gcPreResp.cookies)
-            if gcRedeemResp1.status_code != 302:
-                raise APIException("GC redeem 1 error %s %s" % (gcRedeemResp1.status_code, gcRedeemResp1.text))
+            gcRedeemResp = requests.get("https://connect.garmin.com/post-auth/login", params={"ticket": ticket}, allow_redirects=False, cookies=gcPreResp.cookies)
+            if gcRedeemResp.status_code != 302:
+                raise APIException("GC redeem-start error %s %s" % (gcRedeemResp.status_code, gcRedeemResp.text))
 
-            self._rate_limit()
-            gcRedeemResp2 = requests.get(gcRedeemResp1.headers["location"], cookies=gcPreResp.cookies, allow_redirects=False)
-            if gcRedeemResp2.status_code != 302:
-                raise APIException("GC redeem 2 error %s %s" % (gcRedeemResp2.status_code, gcRedeemResp2.text))
+            # There are 6 redirects that need to be followed to get the correct cookie
+            # ... :(
+            expected_redirect_count = 6
+            current_redirect_count = 1
+            while True:
+		self._rate_limit()
+		gcRedeemResp = requests.get(gcRedeemResp.headers["location"], cookies=gcPreResp.cookies, allow_redirects=False)
+
+		if current_redirect_count >= expected_redirect_count and gcRedeemResp.status_code != 200:
+		    raise APIException("GC redeem %d/%d error %s %s" % (current_redirect_count, expected_redirect_count, gcRedeemResp.status_code, gcRedeemResp.text))
+		if gcRedeemResp.status_code == 200 or gcRedeemResp.status_code == 404:
+		    break
+		current_redirect_count += 1
+		if current_redirect_count > expected_redirect_count:
+		    break
 
         else:
             raise APIException("Unknown GC prestart response %s %s" % (gcPreResp.status_code, gcPreResp.text))
